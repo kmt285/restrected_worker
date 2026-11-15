@@ -5,7 +5,6 @@ import time
 import asyncio
 from datetime import datetime, timezone
 
-# Linux ပေါ်တွင် Cython uvloop ဖြင့် Event Loop အမြန်နှုန်း မြှင့်တင်ခြင်း
 try:
     import uvloop
     uvloop.install()
@@ -49,78 +48,159 @@ MSG_IDS_RAW = os.environ.get("MSG_IDS", "")
 MAX_MB = int(os.environ.get("MAX_MB", "500"))
 WORKERS = int(os.environ.get("WORKERS", "8"))
 SOURCE_LINK = os.environ.get("SOURCE_LINK", "")
+HELPER_BOT_ID = int(os.environ.get("HELPER_BOT_ID", "0") or "0")
 
-PART_SIZE = 512 * 1024  # 512 KB
+PART_SIZE = 512 * 1024      # 512 KB per part
+PIPELINE_BATCH = 4          # Connection ၁ ခုလျှင် တစ်ပြိုင်နက် 4 ပိုင်း (2MB) Pipelining လုပ်မည်
 
-async def resolve_dump_channel(bot: TelegramClient):
+async def resolve_dump_channel(client: TelegramClient):
     if not DUMP_CHANNEL_ID:
         return None
     try:
-        return await bot.get_input_entity(DUMP_CHANNEL_ID)
+        return await client.get_input_entity(DUMP_CHANNEL_ID)
     except Exception:
         raw_id = int(str(abs(DUMP_CHANNEL_ID))[3:]) if str(abs(DUMP_CHANNEL_ID)).startswith("100") else abs(DUMP_CHANNEL_ID)
-        return await bot.get_input_entity(PeerChannel(raw_id))
+        return await client.get_input_entity(PeerChannel(raw_id))
 
 # ==========================================
-# PARALLEL MTPROTO SENDER POOL
+# PERSISTENT PARALLEL MTPROTO SENDER POOL
 # ==========================================
-async def create_sender_pool(client: TelegramClient, dc_id: int, count: int):
-    dc = await client._get_dc(dc_id)
-    senders = []
-    auth_key = None
+class PersistentSenderPool:
+    """Batch Link ဆွဲသည့်အခါ ဖိုင်တစ်ခုပြီးတိုင်း Connection အသစ်ပြန်မချိတ်ရစေရန် ထိန်းသိမ်းပေးသည့် Pool"""
+    def __init__(self):
+        self.dl_pools = {}  # {dc_id: [senders]}
+        self.ul_pool = []
 
-    if dc_id == client.session.dc_id:
-        auth_key = client.session.auth_key
-    else:
-        first_sender = MTProtoSender(None, loggers=client._log)
-        await first_sender.connect(
-            client._connection(
-                dc.ip_address, dc.port, dc.id,
-                loggers=client._log, proxy=client._proxy
+    async def get_dl_senders(self, user_client: TelegramClient, dc_id: int, count: int):
+        if dc_id in self.dl_pools and len(self.dl_pools[dc_id]) >= count:
+            return self.dl_pools[dc_id][:count]
+        senders = await self._create_pool(user_client, dc_id, count)
+        self.dl_pools[dc_id] = senders
+        return senders
+
+    async def get_ul_senders(self, upload_client: TelegramClient, count: int):
+        dc_id = upload_client.session.dc_id
+        if len(self.ul_pool) >= count:
+            return self.ul_pool[:count]
+        self.ul_pool = await self._create_pool(upload_client, dc_id, count)
+        return self.ul_pool
+
+    async def _create_pool(self, client: TelegramClient, dc_id: int, count: int):
+        dc = await client._get_dc(dc_id)
+        senders = []
+        auth_key = None
+
+        if dc_id == client.session.dc_id:
+            auth_key = client.session.auth_key
+        else:
+            first_sender = MTProtoSender(None, loggers=client._log)
+            await first_sender.connect(
+                client._connection(
+                    dc.ip_address, dc.port, dc.id,
+                    loggers=client._log, proxy=client._proxy
+                )
             )
-        )
-        auth = await client(ExportAuthorizationRequest(dc_id))
-        client._init_request.query = ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes)
-        await first_sender.send(InvokeWithLayerRequest(LAYER, client._init_request))
-        auth_key = first_sender.auth_key
-        senders.append(first_sender)
+            auth = await client(ExportAuthorizationRequest(dc_id))
+            client._init_request.query = ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes)
+            await first_sender.send(InvokeWithLayerRequest(LAYER, client._init_request))
+            auth_key = first_sender.auth_key
+            senders.append(first_sender)
 
-    remaining = count - len(senders)
-    for _ in range(remaining):
-        sender = MTProtoSender(auth_key, loggers=client._log)
-        await sender.connect(
-            client._connection(
-                dc.ip_address, dc.port, dc.id,
-                loggers=client._log, proxy=client._proxy
+        remaining = count - len(senders)
+
+        async def connect_single():
+            s = MTProtoSender(auth_key, loggers=client._log)
+            await s.connect(
+                client._connection(
+                    dc.ip_address, dc.port, dc.id,
+                    loggers=client._log, proxy=client._proxy
+                )
             )
-        )
-        client._init_request.query = GetConfigRequest()
-        await sender.send(InvokeWithLayerRequest(LAYER, client._init_request))
-        senders.append(sender)
+            client._init_request.query = GetConfigRequest()
+            await s.send(InvokeWithLayerRequest(LAYER, client._init_request))
+            return s
 
-    return senders
+        # Connection အားလုံးကို တစ်ပြိုင်နက်တည်း (Parallel Handshake) ချိတ်ဆက်ခြင်း
+        extra_senders = await asyncio.gather(*(connect_single() for _ in range(remaining)))
+        senders.extend(extra_senders)
+        return senders
 
-async def close_sender_pool(senders):
-    for s in senders:
+    async def close_all(self):
+        all_senders = list(self.ul_pool)
+        for pool in self.dl_pools.values():
+            all_senders.extend(pool)
+        for s in all_senders:
+            try:
+                await s.disconnect()
+            except Exception:
+                pass
+
+# ==========================================
+# PIPELINED PRODUCER-CONSUMER TURBO ENGINE
+# ==========================================
+async def fetch_single_part(dl_sender: MTProtoSender, location, part_idx: int, file_size: int):
+    offset = part_idx * PART_SIZE
+    expected_len = min(PART_SIZE, file_size - offset)
+    for attempt in range(4):
         try:
-            await s.disconnect()
+            buf = bytearray()
+            curr_off = offset
+            while len(buf) < expected_len:
+                res = await dl_sender.send(
+                    GetFileRequest(location, offset=curr_off, limit=PART_SIZE)
+                )
+                if not res.bytes:
+                    break
+                buf.extend(res.bytes)
+                curr_off += len(res.bytes)
+            return part_idx, bytes(buf[:expected_len])
+        except FloodWaitError as fw:
+            await asyncio.sleep(fw.seconds + 1)
         except Exception:
-            pass
+            if attempt == 3:
+                raise
+            await asyncio.sleep(0.8)
 
-# ==========================================
-# DECOUPLED PRODUCER-CONSUMER TURBO ENGINE
-# ==========================================
-async def decoupled_parallel_stream(
+async def upload_single_part(
+    ul_sender: MTProtoSender,
+    is_big: bool,
+    file_id: int,
+    part_idx: int,
+    total_parts: int,
+    chunk_data: bytes
+):
+    for attempt in range(4):
+        try:
+            if is_big:
+                await ul_sender.send(
+                    SaveBigFilePartRequest(file_id, part_idx, total_parts, chunk_data)
+                )
+            else:
+                await ul_sender.send(
+                    SaveFilePartRequest(file_id, part_idx, chunk_data)
+                )
+            return len(chunk_data)
+        except FloodWaitError as fw:
+            await asyncio.sleep(fw.seconds + 1)
+        except Exception:
+            if attempt == 3:
+                raise
+            await asyncio.sleep(0.8)
+
+async def pipelined_parallel_stream(
+    pool: PersistentSenderPool,
     user_client: TelegramClient,
-    bot_client: TelegramClient,
+    upload_client: TelegramClient,
+    notify_bot: TelegramClient,
     document,
     file_name: str,
     step_label: str,
-    worker_count: int
+    worker_count: int,
+    helper_label: str
 ):
     """
-    Download Senders (Producers) နှင့် Upload Senders (Consumers) ကို သီးခြားခွဲထုတ်ပြီး
-    RAM Queue မှတစ်ဆင့် စောင့်ဆိုင်းချိန်မရှိဘဲ အမြန်ဆုံး လွှဲပြောင်းပေးသည့် စနစ်
+    MTProto Request Pipelining (4x 512KB per tick) နှင့် Decoupled Queue သုံးထားသဖြင့်
+    US -> Singapore Latency ကို 75% လျှော့ချပေးသည့် အမြန်ဆုံး အင်ဂျင်
     """
     file_size = document.size
     total_parts = math.ceil(file_size / PART_SIZE)
@@ -136,16 +216,15 @@ async def decoupled_parallel_stream(
 
     n_workers = min(worker_count, total_parts)
     dl_senders, ul_senders = await asyncio.gather(
-        create_sender_pool(user_client, document.dc_id, n_workers),
-        create_sender_pool(bot_client, bot_client.session.dc_id, n_workers)
+        pool.get_dl_senders(user_client, document.dc_id, n_workers),
+        pool.get_ul_senders(upload_client, n_workers)
     )
 
     part_queue = asyncio.Queue()
     for part_idx in range(total_parts):
         part_queue.put_nowait(part_idx)
 
-    # Bounded RAM Buffer (RAM အသုံးပြုမှု 30 MB ထက် မကျော်စေရန် ထိန်းချုပ်ထားသည်)
-    chunk_queue = asyncio.Queue(maxsize=n_workers * 3)
+    chunk_queue = asyncio.Queue(maxsize=n_workers * PIPELINE_BATCH * 2)
 
     uploaded_bytes = 0
     start_time = time.time()
@@ -153,71 +232,59 @@ async def decoupled_parallel_stream(
 
     async def dl_producer(dl_sender: MTProtoSender):
         while not part_queue.empty():
-            try:
-                part_idx = part_queue.get_nowait()
-            except asyncio.QueueEmpty:
+            batch_indices = []
+            for _ in range(PIPELINE_BATCH):
+                if part_queue.empty():
+                    break
+                try:
+                    batch_indices.append(part_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            if not batch_indices:
                 break
 
-            offset = part_idx * PART_SIZE
-            expected_len = min(PART_SIZE, file_size - offset)
-            chunk_data = None
+            # Pipelining: Connection ၁ ခုပေါ်တွင် Request ၄ ခုကို တစ်ပြိုင်နက်တည်း ပို့ခြင်း
+            results = await asyncio.gather(*(
+                fetch_single_part(dl_sender, location, p_idx, file_size)
+                for p_idx in batch_indices
+            ))
 
-            for attempt in range(4):
-                try:
-                    buf = bytearray()
-                    curr_off = offset
-                    while len(buf) < expected_len:
-                        res = await dl_sender.send(
-                            GetFileRequest(location, offset=curr_off, limit=PART_SIZE)
-                        )
-                        if not res.bytes:
-                            break
-                        buf.extend(res.bytes)
-                        curr_off += len(res.bytes)
-                    chunk_data = bytes(buf[:expected_len])
-                    break
-                except FloodWaitError as fw:
-                    await asyncio.sleep(fw.seconds + 1)
-                except Exception:
-                    if attempt == 3:
-                        raise
-                    await asyncio.sleep(1)
-
-            await chunk_queue.put((part_idx, chunk_data))
-            part_queue.task_done()
+            for p_idx, c_data in results:
+                await chunk_queue.put((p_idx, c_data))
+                part_queue.task_done()
 
     async def ul_consumer(ul_sender: MTProtoSender):
         nonlocal uploaded_bytes
         while True:
-            item = await chunk_queue.get()
-            if item is None:
+            first_item = await chunk_queue.get()
+            if first_item is None:
                 chunk_queue.task_done()
                 break
 
-            part_idx, chunk_data = item
-            for attempt in range(4):
+            batch_items = [first_item]
+            for _ in range(PIPELINE_BATCH - 1):
                 try:
-                    if is_big:
-                        await ul_sender.send(
-                            SaveBigFilePartRequest(file_id, part_idx, total_parts, chunk_data)
-                        )
-                    else:
-                        await ul_sender.send(
-                            SaveFilePartRequest(file_id, part_idx, chunk_data)
-                        )
+                    nxt = chunk_queue.get_nowait()
+                    if nxt is None:
+                        chunk_queue.put_nowait(None)
+                        break
+                    batch_items.append(nxt)
+                except asyncio.QueueEmpty:
                     break
-                except FloodWaitError as fw:
-                    await asyncio.sleep(fw.seconds + 1)
-                except Exception:
-                    if attempt == 3:
-                        raise
-                    await asyncio.sleep(1)
 
-            uploaded_bytes += len(chunk_data)
-            chunk_queue.task_done()
+            # Pipelining: Upload အပိုင်း ၄ ခုကို တစ်ပြိုင်နက်တည်း Telegram သို့ တင်ခြင်း
+            sizes = await asyncio.gather(*(
+                upload_single_part(ul_sender, is_big, file_id, p_idx, total_parts, c_data)
+                for p_idx, c_data in batch_items
+            ))
+
+            uploaded_bytes += sum(sizes)
+            for _ in batch_items:
+                chunk_queue.task_done()
 
             now = time.time()
-            if now - last_edit_time[0] >= 4.5:
+            if now - last_edit_time[0] >= 4.0:
                 last_edit_time[0] = now
                 elapsed = max(now - start_time, 0.1)
                 speed_mb = (uploaded_bytes / (1024 * 1024)) / elapsed
@@ -225,79 +292,53 @@ async def decoupled_parallel_stream(
                 curr_mb = uploaded_bytes / (1024 * 1024)
                 tot_mb = file_size / (1024 * 1024)
                 try:
-                    await bot_client.edit_message(
+                    await notify_bot.edit_message(
                         CHAT_ID,
                         STATUS_MSG_ID,
-                        f"⚡ {step_label} **Decoupled Turbo Engine ({n_workers}x Workers)**\n"
+                        f"⚡ {step_label} **Pipelined Turbo ({n_workers}x | {helper_label})**\n"
                         f"📊 **Progress:** `{pct:.1f}%` (`{curr_mb:.1f} MB` / `{tot_mb:.1f} MB`)\n"
                         f"🚀 **Speed:** `{speed_mb:.2f} MB/s`"
                     )
                 except Exception:
                     pass
 
-    try:
-        producers = [asyncio.create_task(dl_producer(s)) for s in dl_senders]
-        consumers = [asyncio.create_task(ul_consumer(s)) for s in ul_senders]
+    producers = [asyncio.create_task(dl_producer(s)) for s in dl_senders]
+    consumers = [asyncio.create_task(ul_consumer(s)) for s in ul_senders]
 
-        await asyncio.gather(*producers)
-        for _ in range(n_workers):
-            await chunk_queue.put(None)
-        await asyncio.gather(*consumers)
-    finally:
-        await asyncio.gather(
-            close_sender_pool(dl_senders),
-            close_sender_pool(ul_senders)
-        )
+    await asyncio.gather(*producers)
+    for _ in range(n_workers):
+        await chunk_queue.put(None)
+    await asyncio.gather(*consumers)
 
     if is_big:
         return InputFileBig(id=file_id, parts=total_parts, name=file_name)
     return InputFile(id=file_id, parts=total_parts, name=file_name, md5_checksum="")
 
 # ==========================================
-# BACKUP CHANNEL & MONGODB FILE_ID SAVER
+# DB CHANNEL CACHE SAVER
 # ==========================================
-async def backup_and_cache_post(
+async def save_cache_record(
     bot_client: TelegramClient,
-    dump_entity,
+    main_dump_entity,
     cache_col,
-    sent_msg,
+    dump_msg_id: int,
     peer_key: str,
     msg_id: int,
     file_name: str,
     file_size: int,
     mime_type: str
 ):
-    """
-    User ထံ ပို့ပြီးသား မက်ဆေ့ချ်ကို Private Backup Channel သို့ Copy ပွားပြီး
-    Telegram file_id နှင့် dump_msg_id ကို MongoDB တွင် သိမ်းဆည်းခြင်း (0 Extra Upload Bandwidth)
-    """
-    if not dump_entity or not sent_msg:
+    if not main_dump_entity or not dump_msg_id:
         return
-
     try:
-        # ၁။ မူရင်း မက်ဆေ့ချ်အတိုင်း Backup Channel ထဲသို့ Copy ပို့ခြင်း
-        dump_msg = await bot_client.send_message(dump_entity, sent_msg)
-
-        # ၂။ Packed Telegram File ID ထုတ်ယူခြင်း
-        packed_file_id = ""
-        if dump_msg.media:
-            try:
-                packed_file_id = utils.pack_bot_file_id(dump_msg.media)
-            except Exception:
-                packed_file_id = ""
-
-        # ၃။ Backup Channel တွင် Admin ကြည့်ရှုနိုင်ရန် Audit Info ကို Reply ပြန်ထားခြင်း
         await bot_client.send_message(
-            dump_entity,
+            main_dump_entity,
             f"🗂️ **Backup Audit Log**\n"
             f"👤 **User ID:** `{USER_ID}`\n"
             f"🔗 **Source:** `{SOURCE_LINK}` (Post `{msg_id}`)\n"
-            f"📦 **Size:** `{file_size / (1024 * 1024):.2f} MB`\n"
-            f"🆔 **File ID:** `{packed_file_id or 'Text/Other'}`",
-            reply_to=dump_msg.id
+            f"📦 **Size:** `{file_size / (1024 * 1024):.2f} MB`",
+            reply_to=dump_msg_id
         )
-
-        # ၄။ MongoDB file_cache တွင် သိမ်းဆည်းခြင်း
         cache_key = f"{peer_key}:{msg_id}"
         await cache_col.update_one(
             {"cache_key": cache_key},
@@ -305,30 +346,30 @@ async def backup_and_cache_post(
                 "cache_key": cache_key,
                 "peer_id": peer_key,
                 "msg_id": msg_id,
-                "dump_msg_id": dump_msg.id,
-                "file_id": packed_file_id,
+                "dump_msg_id": dump_msg_id,
                 "file_name": file_name,
                 "file_size": file_size,
                 "mime_type": mime_type,
-                "is_media": bool(dump_msg.media),
                 "cached_by": USER_ID,
                 "cached_at": time.time()
             }},
             upsert=True
         )
     except Exception as e:
-        print(f"Backup & Cache Error: {e}")
+        print(f"DB Cache Save Error: {e}")
 
 # ==========================================
 # MAIN CLONING WORKFLOW
 # ==========================================
 async def process_cloning():
+    # ၁။ Main Bot ချိတ်ဆက်ခြင်း
     bot_client = TelegramClient(StringSession(), API_ID, API_HASH)
     await bot_client.start(bot_token=BOT_TOKEN)
 
     mongo = AsyncMongoClient(MONGO_URI)
     db = mongo["restricted_saver_db"]
     users_col = db["users"]
+    settings_col = db["settings"]
     cache_col = db["file_cache"]
 
     user_doc = await users_col.find_one({"user_id": USER_ID})
@@ -337,6 +378,31 @@ async def process_cloning():
         await bot_client.disconnect()
         await mongo.close()
         return
+
+    # ၂။ Helper Bot ရှိပါက MongoDB မှ လှမ်းယူပြီး ချိတ်ဆက်ခြင်း (DB Channel Bridge)
+    upload_client = bot_client
+    helper_label = "MainBot"
+    use_helper_bridge = False
+    helper_dump_entity = None
+
+    main_dump_entity = await resolve_dump_channel(bot_client)
+
+    if HELPER_BOT_ID and DUMP_CHANNEL_ID and main_dump_entity:
+        cfg_doc = await settings_col.find_one({"_id": "global_config"})
+        if cfg_doc:
+            for h in cfg_doc.get("helper_bots", []):
+                if h["id"] == HELPER_BOT_ID:
+                    try:
+                        h_client = TelegramClient(StringSession(), API_ID, API_HASH)
+                        await h_client.start(bot_token=h["token"])
+                        helper_dump_entity = await resolve_dump_channel(h_client)
+                        if helper_dump_entity:
+                            upload_client = h_client
+                            helper_label = f"@{h['username']}"
+                            use_helper_bridge = True
+                    except Exception as e:
+                        print(f"Helper bot init fallback to main bot: {e}")
+                    break
 
     peer = int(PEER_ID) if PEER_ID.lstrip("-").isdigit() else PEER_ID
     msg_ids = [int(x) for x in MSG_IDS_RAW.split(",") if x.strip().isdigit()]
@@ -347,15 +413,16 @@ async def process_cloning():
     if not await user_client.is_user_authorized():
         await bot_client.edit_message(CHAT_ID, STATUS_MSG_ID, "❌ **သင်၏ Session သက်တမ်းကုန်သွားပါပြီ။** `/start` နှိပ်ပြီး ပြန်ဝင်ပါ။")
         await user_client.disconnect()
+        if use_helper_bridge:
+            await upload_client.disconnect()
         await bot_client.disconnect()
         await mongo.close()
         return
 
-    dump_entity = await resolve_dump_channel(bot_client)
     max_allowed_bytes = MAX_MB * 1024 * 1024
-
     completed_files = 0
     completed_bytes = 0
+    sender_pool = PersistentSenderPool()
 
     try:
         total_posts = len(msg_ids)
@@ -367,21 +434,21 @@ async def process_cloning():
                 await bot_client.send_message(CHAT_ID, f"⚠️ {step_label} ပို့စ်နံပါတ် `{msg_id}` ကို ရှာမတွေ့ပါ။")
                 continue
 
-            # ၁။ စာသားသက်သက် ဖြစ်ပါက
+            # ၁။ စာသားသက်သက်
             if not msg.media:
                 if msg.text:
                     sent_msg = await bot_client.send_message(CHAT_ID, msg.text, formatting_entities=msg.entities)
-                    await backup_and_cache_post(bot_client, dump_entity, cache_col, sent_msg, PEER_ID, msg_id, "text", 0, "text/plain")
+                    if main_dump_entity:
+                        d_msg = await bot_client.send_message(main_dump_entity, sent_msg)
+                        await save_cache_record(bot_client, main_dump_entity, cache_col, d_msg.id, PEER_ID, msg_id, "text", 0, "text/plain")
                     completed_files += 1
                 continue
 
-            # ဖိုင်အရွယ်အစား စစ်ဆေးခြင်း (Free vs VIP Max MB)
             f_size = getattr(msg.file, "size", 0) or 0
             if f_size > max_allowed_bytes:
                 await bot_client.send_message(
                     CHAT_ID,
-                    f"⚠️ {step_label} ပို့စ် `{msg_id}` ၏ ဖိုင်ဆိုဒ် (`{f_size / (1024 * 1024):.1f} MB`) သည် သင်၏ အမြင့်ဆုံး ကန့်သတ်ချက် (`{MAX_MB} MB`) ထက် ကျော်လွန်နေပါသည်။\n"
-                    f"*(2GB အထိ ဒေါင်းလုဒ်ဆွဲလိုပါက 💎 VIP သို့ အဆင့်မြှင့်တင်ပါ)*"
+                    f"⚠️ {step_label} ပို့စ် `{msg_id}` ၏ ဖိုင်ဆိုဒ် (`{f_size / (1024 * 1024):.1f} MB`) သည် သင်၏ Limit (`{MAX_MB} MB`) ထက် ကျော်လွန်နေပါသည်။"
                 )
                 continue
 
@@ -400,22 +467,24 @@ async def process_cloning():
                     caption=msg.text or "",
                     formatting_entities=msg.entities
                 )
-                await backup_and_cache_post(
-                    bot_client, dump_entity, cache_col, sent_msg,
-                    PEER_ID, msg_id, f_name, f_size, getattr(msg.file, "mime_type", "image/jpeg")
-                )
+                if main_dump_entity:
+                    d_msg = await bot_client.send_message(main_dump_entity, sent_msg)
+                    await save_cache_record(
+                        bot_client, main_dump_entity, cache_col, d_msg.id,
+                        PEER_ID, msg_id, f_name, f_size, getattr(msg.file, "mime_type", "image/jpeg")
+                    )
                 completed_files += 1
                 completed_bytes += f_size
                 continue
 
-            # ၃။ 2MB အထက် ဖိုင်ကြီးများ (Decoupled Producer-Consumer Turbo Engine)
+            # ၃။ 2MB အထက် ဖိုင်ကြီးများ (Pipelined Turbo Engine + Helper Bot Bridge)
             doc = msg.document
             file_name = getattr(msg.file, "name", None) or f"video_{msg_id}{getattr(msg.file, 'ext', '') or '.mp4'}"
 
             await bot_client.edit_message(
                 CHAT_ID,
                 STATUS_MSG_ID,
-                f"🚀 {step_label} **Turbo Engine ({WORKERS}x Workers) စတင်နေပါသည်...**\n"
+                f"🚀 {step_label} **Pipelined Engine ({WORKERS}x | {helper_label}) စတင်နေပါသည်...**\n"
                 f"📦 **ဖိုင်အရွယ်အစား:** `{doc.size / (1024 * 1024):.1f} MB`"
             )
 
@@ -426,7 +495,7 @@ async def process_cloning():
                     await user_client.download_media(msg, thumb=-1, file=thumb_buf)
                     thumb_buf.seek(0)
                     thumb_buf.name = "thumb.jpg"
-                    uploaded_thumb = await bot_client.upload_file(thumb_buf)
+                    uploaded_thumb = await upload_client.upload_file(thumb_buf)
                 except Exception:
                     uploaded_thumb = None
 
@@ -449,13 +518,16 @@ async def process_cloning():
             if not has_filename:
                 attributes.append(DocumentAttributeFilename(file_name=file_name))
 
-            input_file = await decoupled_parallel_stream(
+            input_file = await pipelined_parallel_stream(
+                pool=sender_pool,
                 user_client=user_client,
-                bot_client=bot_client,
+                upload_client=upload_client,
+                notify_bot=bot_client,
                 document=doc,
                 file_name=file_name,
                 step_label=step_label,
-                worker_count=WORKERS
+                worker_count=WORKERS,
+                helper_label=helper_label
             )
 
             media = InputMediaUploadedDocument(
@@ -466,26 +538,41 @@ async def process_cloning():
                 force_file=False
             )
 
-            sent_msg = await bot_client.send_file(
-                CHAT_ID,
-                file=media,
-                caption=msg.text or "",
-                formatting_entities=msg.entities
-            )
-
-            # Backup Channel သို့ Copy ပို့ပြီး file_id သိမ်းဆည်းခြင်း
-            await backup_and_cache_post(
-                bot_client, dump_entity, cache_col, sent_msg,
-                PEER_ID, msg_id, file_name, doc.size, doc.mime_type or "video/mp4"
-            )
+            # Helper Bot သုံးထားပါက DB Channel သို့ အရင်တင်ပြီး Main Bot က User ထံ ချက်ချင်းကူးပို့မည်
+            if use_helper_bridge and helper_dump_entity and main_dump_entity:
+                helper_dump_msg = await upload_client.send_file(
+                    helper_dump_entity,
+                    file=media,
+                    caption=msg.text or "",
+                    formatting_entities=msg.entities
+                )
+                # Main Bot က DB Channel မှ မက်ဆေ့ချ်ကို ဆွဲယူပြီး User ထံ 0.1s ဖြင့် ပို့ပေးခြင်း
+                main_copy = await bot_client.get_messages(main_dump_entity, ids=helper_dump_msg.id)
+                await bot_client.send_message(CHAT_ID, main_copy)
+                await save_cache_record(
+                    bot_client, main_dump_entity, cache_col, helper_dump_msg.id,
+                    PEER_ID, msg_id, file_name, doc.size, doc.mime_type or "video/mp4"
+                )
+            else:
+                sent_msg = await bot_client.send_file(
+                    CHAT_ID,
+                    file=media,
+                    caption=msg.text or "",
+                    formatting_entities=msg.entities
+                )
+                if main_dump_entity:
+                    d_msg = await bot_client.send_message(main_dump_entity, sent_msg)
+                    await save_cache_record(
+                        bot_client, main_dump_entity, cache_col, d_msg.id,
+                        PEER_ID, msg_id, file_name, doc.size, doc.mime_type or "video/mp4"
+                    )
 
             completed_files += 1
             completed_bytes += doc.size
 
             if total_posts > 1:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.0)
 
-        # User ၏ ယနေ့သုံးစွဲမှုနှင့် စုစုပေါင်း သုံးစွဲမှု မှတ်တမ်းတင်ခြင်း
         if completed_files > 0:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await users_col.update_one(
@@ -510,7 +597,10 @@ async def process_cloning():
             f"❌ **အမှားဖြစ်ပေါ်နေပါသည်:** `{str(e)}`"
         )
     finally:
+        await sender_pool.close_all()
         await user_client.disconnect()
+        if use_helper_bridge:
+            await upload_client.disconnect()
         await bot_client.disconnect()
         await mongo.close()
 
