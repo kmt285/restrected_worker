@@ -1,0 +1,35 @@
+name: Restricted Content Cloner Worker
+
+on:
+  repository_dispatch:
+    types: [clone_content]
+  workflow_dispatch:
+
+jobs:
+  clone_job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout Public Worker Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Cloner Script
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          USER_ID: ${{ github.event.client_payload.user_id }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          STATUS_MSG_ID: ${{ github.event.client_payload.status_msg_id }}
+          POST_LINK: ${{ github.event.client_payload.link }}
+        run: python cloner.py
